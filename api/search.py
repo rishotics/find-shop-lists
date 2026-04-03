@@ -1,22 +1,14 @@
-"""Vercel serverless function: /api/search"""
+"""Vercel serverless function: POST /api/search"""
 import os
 import json
 import time
 import hashlib
+import secrets
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler
 import requests as http_requests
-from eth_account import Account
-from eth_account.messages import encode_defunct
-from web3 import Web3
 
 STABLEENRICH_BASE = "https://stableenrich.dev"
-
-# Wallet setup
-WALLET_PRIVATE_KEY = os.environ.get("WALLET_PRIVATE_KEY", "")
-wallet_account = None
-if WALLET_PRIVATE_KEY:
-    key = WALLET_PRIVATE_KEY if WALLET_PRIVATE_KEY.startswith("0x") else "0x" + WALLET_PRIVATE_KEY
-    wallet_account = Account.from_key(key)
 
 # In-memory cache (per lambda instance)
 search_cache = {}
@@ -35,46 +27,38 @@ AREA_COORDS = {
     "agra": {"lat": 27.18, "lng": 78.02},
     "varanasi": {"lat": 25.32, "lng": 83.01},
     "banda": {"lat": 25.48, "lng": 80.34},
+    "delhi": {"lat": 28.61, "lng": 77.23},
+    "noida": {"lat": 28.57, "lng": 77.32},
+    "ghaziabad": {"lat": 28.67, "lng": 77.42},
+    "jaipur": {"lat": 26.91, "lng": 75.79},
+    "patna": {"lat": 25.60, "lng": 85.10},
+    "bhopal": {"lat": 23.26, "lng": 77.41},
+    "indore": {"lat": 22.72, "lng": 75.86},
+    "mumbai": {"lat": 19.08, "lng": 72.88},
+    "pune": {"lat": 18.52, "lng": 73.86},
+    "hyderabad": {"lat": 17.39, "lng": 78.49},
+    "bangalore": {"lat": 12.97, "lng": 77.59},
+    "chennai": {"lat": 13.08, "lng": 80.27},
+    "kolkata": {"lat": 22.57, "lng": 88.36},
+    "ahmedabad": {"lat": 23.02, "lng": 72.57},
+    "surat": {"lat": 21.17, "lng": 72.83},
+    "burhanpur": {"lat": 21.31, "lng": 76.23},
 }
 
 
-def x402_post(url, payload):
-    headers = {"Content-Type": "application/json"}
-    resp = http_requests.post(url, json=payload, headers=headers, timeout=30)
-    if resp.status_code == 200:
-        return resp.json()
-    if resp.status_code != 402 or not wallet_account:
-        return None
+def api_post(url, payload):
+    """Simple POST to stableenrich - no x402 payment (handled by Vercel proxy or future integration)"""
     try:
-        x_payment = resp.headers.get("X-PAYMENT-REQUIRED") or resp.headers.get("x-payment-required")
-        payment_details = json.loads(x_payment) if x_payment else resp.json()
-        price = payment_details.get("maxAmountRequired", payment_details.get("price", "0"))
-        payment_payload = {
-            "x402Version": 2,
-            "scheme": "exact",
-            "network": "eip155:8453",
-            "payload": {
-                "signature": "",
-                "authorization": {
-                    "from": wallet_account.address,
-                    "to": payment_details.get("payTo", ""),
-                    "value": str(price),
-                    "validAfter": "0",
-                    "validBefore": str(int(time.time()) + 3600),
-                    "nonce": Web3.keccak(text=str(time.time())).hex(),
-                }
-            }
-        }
-        message = json.dumps(payment_payload["payload"]["authorization"], sort_keys=True)
-        msg = encode_defunct(text=message)
-        signed = wallet_account.sign_message(msg)
-        payment_payload["payload"]["signature"] = signed.signature.hex()
-        headers["X-PAYMENT"] = json.dumps(payment_payload)
-        resp2 = http_requests.post(url, json=payload, headers=headers, timeout=30)
-        if resp2.status_code == 200:
-            return resp2.json()
+        resp = http_requests.post(
+            url, json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=25
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        print(f"[API] {url} returned {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        print(f"[x402] error: {e}")
+        print(f"[API] error calling {url}: {e}")
     return None
 
 
@@ -86,13 +70,13 @@ def search_google_maps(text_query, lat, lng, radius=50000):
         "locationBias": {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": radius}},
         "languageCode": "en",
     }
-    result = x402_post(url, payload)
+    result = api_post(url, payload)
     return result.get("places", []) if result else []
 
 
 def search_firecrawl(query, limit=10):
     url = f"{STABLEENRICH_BASE}/api/firecrawl/search"
-    result = x402_post(url, {"query": query, "limit": limit})
+    result = api_post(url, {"query": query, "limit": limit})
     return result.get("results", []) if result else []
 
 
@@ -115,14 +99,9 @@ def normalize_place(place):
 def normalize_web_result(result):
     return {
         "name": result.get("title", "Unknown"),
-        "address": "",
-        "phone": "",
+        "address": "", "phone": "",
         "website": result.get("url", ""),
-        "rating": "",
-        "reviews": "",
-        "status": "",
-        "hours": "",
-        "maps_link": "",
+        "rating": "", "reviews": "", "status": "", "hours": "", "maps_link": "",
         "source": "Web Search",
         "description": result.get("description", ""),
     }
@@ -139,6 +118,16 @@ def parse_areas(area_text):
     return areas
 
 
+def json_response(handler, status, data):
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+    handler.end_headers()
+    handler.wfile.write(json.dumps(data).encode())
+
+
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
@@ -150,29 +139,16 @@ class handler(BaseHTTPRequestHandler):
         comments = data.get("comments", "").strip()
 
         if not keywords or not areas:
-            self.send_response(400)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "Keywords and area are required"}).encode())
-            return
-
-        if not wallet_account:
-            self.send_response(503)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "no_wallet", "message": "Server not configured. Set WALLET_PRIVATE_KEY env variable."}).encode())
-            return
+            return json_response(self, 400, {"error": "Keywords and area are required"})
 
         # Check cache
-        cache_key = hashlib.md5(json.dumps({"keywords": keywords, "areas": areas, "comments": comments}, sort_keys=True).encode()).hexdigest()
+        cache_key = hashlib.md5(
+            json.dumps({"k": keywords, "a": areas, "c": comments}, sort_keys=True).encode()
+        ).hexdigest()
         if cache_key in search_cache:
             cached = search_cache[cache_key]
             if time.time() - cached["time"] < CACHE_TTL:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(cached["data"]).encode())
-                return
+                return json_response(self, 200, cached["data"])
 
         area_list = parse_areas(areas)
         all_results = []
@@ -192,7 +168,7 @@ class handler(BaseHTTPRequestHandler):
                         seen_names.add(key)
                         all_results.append(normalized)
 
-            web_query = f"{keywords} {area['name']} Uttar Pradesh justdial indiamart"
+            web_query = f"{keywords} {area['name']} justdial indiamart"
             for result in search_firecrawl(web_query, limit=5):
                 normalized = normalize_web_result(result)
                 normalized["area"] = area["name"]
@@ -201,7 +177,6 @@ class handler(BaseHTTPRequestHandler):
                     seen_names.add(key)
                     all_results.append(normalized)
 
-        from datetime import datetime
         response_data = {
             "results": all_results,
             "count": len(all_results),
@@ -210,12 +185,7 @@ class handler(BaseHTTPRequestHandler):
         }
 
         search_cache[cache_key] = {"data": response_data, "time": time.time()}
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps(response_data).encode())
+        return json_response(self, 200, response_data)
 
     def do_OPTIONS(self):
         self.send_response(200)
