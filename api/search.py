@@ -1,16 +1,26 @@
-"""Vercel serverless function: POST /api/search"""
+"""Vercel serverless function: POST /api/search
+Uses x402 payment protocol to call stableenrich.dev APIs.
+"""
 import os
 import json
 import time
 import hashlib
-import secrets
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler
 import requests as http_requests
+from eth_account import Account
+from eth_account.messages import encode_defunct
+from web3 import Web3
 
 STABLEENRICH_BASE = "https://stableenrich.dev"
 
-# In-memory cache (per lambda instance)
+# Wallet from env
+WALLET_PRIVATE_KEY = os.environ.get("WALLET_PRIVATE_KEY", "")
+wallet_account = None
+if WALLET_PRIVATE_KEY:
+    key = WALLET_PRIVATE_KEY if WALLET_PRIVATE_KEY.startswith("0x") else "0x" + WALLET_PRIVATE_KEY
+    wallet_account = Account.from_key(key)
+
 search_cache = {}
 CACHE_TTL = 3600
 
@@ -43,22 +53,56 @@ AREA_COORDS = {
     "ahmedabad": {"lat": 23.02, "lng": 72.57},
     "surat": {"lat": 21.17, "lng": 72.83},
     "burhanpur": {"lat": 21.31, "lng": 76.23},
+    "nagpur": {"lat": 21.15, "lng": 79.09},
+    "raipur": {"lat": 21.25, "lng": 81.63},
 }
 
 
-def api_post(url, payload):
-    """Simple POST to stableenrich - no x402 payment (handled by Vercel proxy or future integration)"""
+def x402_post(url, payload):
+    """POST with x402 payment handling."""
+    headers = {"Content-Type": "application/json"}
+    resp = http_requests.post(url, json=payload, headers=headers, timeout=25)
+
+    if resp.status_code == 200:
+        return resp.json()
+
+    if resp.status_code != 402 or not wallet_account:
+        return None
+
     try:
-        resp = http_requests.post(
-            url, json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=25
-        )
-        if resp.status_code == 200:
-            return resp.json()
-        print(f"[API] {url} returned {resp.status_code}: {resp.text[:200]}")
+        # Parse 402 payment requirements
+        x_pay = resp.headers.get("X-PAYMENT-REQUIRED") or resp.headers.get("x-payment-required")
+        pay_info = json.loads(x_pay) if x_pay else resp.json()
+
+        price = pay_info.get("maxAmountRequired", pay_info.get("price", "0"))
+        nonce = Web3.keccak(text=str(time.time())).hex()
+
+        auth = {
+            "from": wallet_account.address,
+            "to": pay_info.get("payTo", ""),
+            "value": str(price),
+            "validAfter": "0",
+            "validBefore": str(int(time.time()) + 3600),
+            "nonce": nonce,
+        }
+
+        msg = encode_defunct(text=json.dumps(auth, sort_keys=True))
+        sig = wallet_account.sign_message(msg)
+
+        payment = {
+            "x402Version": 2,
+            "scheme": "exact",
+            "network": "eip155:8453",
+            "payload": {"signature": sig.signature.hex(), "authorization": auth},
+        }
+
+        headers["X-PAYMENT"] = json.dumps(payment)
+        resp2 = http_requests.post(url, json=payload, headers=headers, timeout=25)
+        if resp2.status_code == 200:
+            return resp2.json()
+        print(f"[x402] retry failed: {resp2.status_code}")
     except Exception as e:
-        print(f"[API] error calling {url}: {e}")
+        print(f"[x402] error: {e}")
     return None
 
 
@@ -70,13 +114,13 @@ def search_google_maps(text_query, lat, lng, radius=50000):
         "locationBias": {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": radius}},
         "languageCode": "en",
     }
-    result = api_post(url, payload)
+    result = x402_post(url, payload)
     return result.get("places", []) if result else []
 
 
 def search_firecrawl(query, limit=10):
     url = f"{STABLEENRICH_BASE}/api/firecrawl/search"
-    result = api_post(url, {"query": query, "limit": limit})
+    result = x402_post(url, {"query": query, "limit": limit})
     return result.get("results", []) if result else []
 
 
@@ -118,14 +162,14 @@ def parse_areas(area_text):
     return areas
 
 
-def json_response(handler, status, data):
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json")
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
-    handler.end_headers()
-    handler.wfile.write(json.dumps(data).encode())
+def json_response(h, status, data):
+    h.send_response(status)
+    h.send_header("Content-Type", "application/json")
+    h.send_header("Access-Control-Allow-Origin", "*")
+    h.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+    h.send_header("Access-Control-Allow-Headers", "Content-Type")
+    h.end_headers()
+    h.wfile.write(json.dumps(data).encode())
 
 
 class handler(BaseHTTPRequestHandler):
@@ -141,7 +185,13 @@ class handler(BaseHTTPRequestHandler):
         if not keywords or not areas:
             return json_response(self, 400, {"error": "Keywords and area are required"})
 
-        # Check cache
+        if not wallet_account:
+            return json_response(self, 503, {
+                "error": "no_wallet",
+                "message": "Server not configured. WALLET_PRIVATE_KEY env var is missing."
+            })
+
+        # Cache check
         cache_key = hashlib.md5(
             json.dumps({"k": keywords, "a": areas, "c": comments}, sort_keys=True).encode()
         ).hexdigest()

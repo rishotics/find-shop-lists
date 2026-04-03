@@ -842,8 +842,14 @@ async function handleSearch(e) {
     });
 
     if (!resp.ok) {
-      const err = await resp.json();
-      throw new Error(err.message || translations[currentLang].errorMsg);
+      let errMsg = translations[currentLang].errorMsg;
+      try {
+        const err = await resp.json();
+        errMsg = err.message || errMsg;
+      } catch(e) {
+        errMsg = `Server error (${resp.status}). Please try again.`;
+      }
+      throw new Error(errMsg);
     }
 
     const data = await resp.json();
@@ -851,6 +857,15 @@ async function handleSearch(e) {
     renderResults(lastResults);
   } catch (err) {
     showToast(err.message || translations[currentLang].errorMsg);
+    // Show empty results section so user sees something
+    document.getElementById('resultsSection').classList.add('visible');
+    document.getElementById('resultCount').textContent = '0';
+    document.getElementById('resultsGrid').innerHTML = `
+      <div class="empty-state">
+        <div class="icon">⚠️</div>
+        <h3>${err.message}</h3>
+        <p>Please try again in a moment.</p>
+      </div>`;
   } finally {
     btn.classList.remove('loading');
     btn.disabled = false;
