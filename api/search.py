@@ -1,5 +1,8 @@
-"""Vercel serverless function: POST /api/search
-Uses x402 payment protocol to call stableenrich.dev APIs.
+"""Vercel serverless: POST /api/search
+Uses Google Maps Places API (New) + SerpAPI for web results.
+
+Env vars:
+  GOOGLE_MAPS_API_KEY - Google Cloud API key with Places API enabled
 """
 import os
 import json
@@ -7,19 +10,11 @@ import time
 import hashlib
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler
-import requests as http_requests
-from eth_account import Account
-from eth_account.messages import encode_defunct
-from web3 import Web3
+import urllib.request
+import urllib.parse
+import urllib.error
 
-STABLEENRICH_BASE = "https://stableenrich.dev"
-
-# Wallet from env
-WALLET_PRIVATE_KEY = os.environ.get("WALLET_PRIVATE_KEY", "")
-wallet_account = None
-if WALLET_PRIVATE_KEY:
-    key = WALLET_PRIVATE_KEY if WALLET_PRIVATE_KEY.startswith("0x") else "0x" + WALLET_PRIVATE_KEY
-    wallet_account = Account.from_key(key)
+GOOGLE_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
 
 search_cache = {}
 CACHE_TTL = 3600
@@ -55,79 +50,76 @@ AREA_COORDS = {
     "burhanpur": {"lat": 21.31, "lng": 76.23},
     "nagpur": {"lat": 21.15, "lng": 79.09},
     "raipur": {"lat": 21.25, "lng": 81.63},
+    "meerut": {"lat": 28.98, "lng": 77.71},
+    "bareilly": {"lat": 28.37, "lng": 79.42},
+    "gorakhpur": {"lat": 26.76, "lng": 83.37},
 }
 
 
-def x402_post(url, payload):
-    """POST with x402 payment handling."""
-    headers = {"Content-Type": "application/json"}
-    resp = http_requests.post(url, json=payload, headers=headers, timeout=25)
-
-    if resp.status_code == 200:
-        return resp.json()
-
-    if resp.status_code != 402 or not wallet_account:
-        return None
-
+def api_request(url, payload=None, method="POST"):
+    """Make HTTP request using urllib (no external deps)."""
     try:
-        # Parse 402 payment requirements
-        x_pay = resp.headers.get("X-PAYMENT-REQUIRED") or resp.headers.get("x-payment-required")
-        pay_info = json.loads(x_pay) if x_pay else resp.json()
-
-        price = pay_info.get("maxAmountRequired", pay_info.get("price", "0"))
-        nonce = Web3.keccak(text=str(time.time())).hex()
-
-        auth = {
-            "from": wallet_account.address,
-            "to": pay_info.get("payTo", ""),
-            "value": str(price),
-            "validAfter": "0",
-            "validBefore": str(int(time.time()) + 3600),
-            "nonce": nonce,
-        }
-
-        msg = encode_defunct(text=json.dumps(auth, sort_keys=True))
-        sig = wallet_account.sign_message(msg)
-
-        payment = {
-            "x402Version": 2,
-            "scheme": "exact",
-            "network": "eip155:8453",
-            "payload": {"signature": sig.signature.hex(), "authorization": auth},
-        }
-
-        headers["X-PAYMENT"] = json.dumps(payment)
-        resp2 = http_requests.post(url, json=payload, headers=headers, timeout=25)
-        if resp2.status_code == 200:
-            return resp2.json()
-        print(f"[x402] retry failed: {resp2.status_code}")
+        data = json.dumps(payload).encode() if payload else None
+        headers = {"Content-Type": "application/json"}
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        print(f"[API] HTTP {e.code}: {url}")
+        return None
     except Exception as e:
-        print(f"[x402] error: {e}")
-    return None
+        print(f"[API] Error: {e}")
+        return None
 
 
 def search_google_maps(text_query, lat, lng, radius=50000):
-    url = f"{STABLEENRICH_BASE}/api/google-maps/text-search/full"
+    """Google Maps Places API (New) - Text Search."""
+    if not GOOGLE_API_KEY:
+        return []
+
+    url = f"https://places.googleapis.com/v1/places:searchText"
     payload = {
         "textQuery": text_query,
-        "maxResultCount": 5,
-        "locationBias": {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": radius}},
+        "maxResultCount": 10,
+        "locationBias": {
+            "circle": {
+                "center": {"latitude": lat, "longitude": lng},
+                "radius": radius,
+            }
+        },
         "languageCode": "en",
     }
-    result = x402_post(url, payload)
-    return result.get("places", []) if result else []
 
-
-def search_firecrawl(query, limit=10):
-    url = f"{STABLEENRICH_BASE}/api/firecrawl/search"
-    result = x402_post(url, {"query": query, "limit": limit})
-    return result.get("results", []) if result else []
+    try:
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("X-Goog-Api-Key", GOOGLE_API_KEY)
+        req.add_header("X-Goog-FieldMask",
+            "places.id,places.displayName,places.formattedAddress,"
+            "places.nationalPhoneNumber,places.internationalPhoneNumber,"
+            "places.websiteUri,places.rating,places.userRatingCount,"
+            "places.businessStatus,places.regularOpeningHours,"
+            "places.googleMapsUri"
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            result = json.loads(resp.read().decode())
+            return result.get("places", [])
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.fp else ""
+        print(f"[Google Maps] HTTP {e.code}: {body[:200]}")
+        return []
+    except Exception as e:
+        print(f"[Google Maps] Error: {e}")
+        return []
 
 
 def normalize_place(place):
-    hours_list = place.get("regularOpeningHours", {}).get("weekdayDescriptions", [])
+    dn = place.get("displayName", {})
+    hours_obj = place.get("regularOpeningHours", {})
+    hours_list = hours_obj.get("weekdayDescriptions", [])
     return {
-        "name": place.get("displayName", {}).get("text", "Unknown"),
+        "name": dn.get("text", "Unknown"),
         "address": place.get("formattedAddress", ""),
         "phone": place.get("nationalPhoneNumber", "") or place.get("internationalPhoneNumber", ""),
         "website": place.get("websiteUri", ""),
@@ -137,17 +129,6 @@ def normalize_place(place):
         "hours": "; ".join(hours_list) if hours_list else "",
         "maps_link": place.get("googleMapsUri", ""),
         "source": "Google Maps",
-    }
-
-
-def normalize_web_result(result):
-    return {
-        "name": result.get("title", "Unknown"),
-        "address": "", "phone": "",
-        "website": result.get("url", ""),
-        "rating": "", "reviews": "", "status": "", "hours": "", "maps_link": "",
-        "source": "Web Search",
-        "description": result.get("description", ""),
     }
 
 
@@ -185,13 +166,13 @@ class handler(BaseHTTPRequestHandler):
         if not keywords or not areas:
             return json_response(self, 400, {"error": "Keywords and area are required"})
 
-        if not wallet_account:
+        if not GOOGLE_API_KEY:
             return json_response(self, 503, {
-                "error": "no_wallet",
-                "message": "Server not configured. WALLET_PRIVATE_KEY env var is missing."
+                "error": "no_key",
+                "message": "Server not configured. Set GOOGLE_MAPS_API_KEY env variable."
             })
 
-        # Cache check
+        # Cache
         cache_key = hashlib.md5(
             json.dumps({"k": keywords, "a": areas, "c": comments}, sort_keys=True).encode()
         ).hexdigest()
@@ -205,7 +186,10 @@ class handler(BaseHTTPRequestHandler):
         seen_names = set()
 
         for area in area_list:
-            queries = [f"{keywords} {area['name']}", f"{keywords} shop dealer {area['name']}"]
+            queries = [
+                f"{keywords} {area['name']}",
+                f"{keywords} shop dealer {area['name']}",
+            ]
             if comments:
                 queries.append(f"{keywords} {comments} {area['name']}")
 
@@ -217,15 +201,6 @@ class handler(BaseHTTPRequestHandler):
                     if key not in seen_names:
                         seen_names.add(key)
                         all_results.append(normalized)
-
-            web_query = f"{keywords} {area['name']} justdial indiamart"
-            for result in search_firecrawl(web_query, limit=5):
-                normalized = normalize_web_result(result)
-                normalized["area"] = area["name"]
-                key = normalized["name"].lower().strip()
-                if key not in seen_names and any(kw in key for kw in keywords.lower().split()[:2]):
-                    seen_names.add(key)
-                    all_results.append(normalized)
 
         response_data = {
             "results": all_results,
