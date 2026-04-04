@@ -1,12 +1,18 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
+# Next.js
+.next/
+out/
+
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Build
 dist/
 build/
-venv/
-.env
 
 # OS
 .DS_Store
@@ -17,10 +23,3 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
-
-# Data files (large/generated)
-*.xlsx
-
-# Flask
-instance/
-node_modules/
