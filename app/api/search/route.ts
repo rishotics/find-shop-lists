@@ -236,9 +236,12 @@ function parseShopsFromMarkdown(content: string, sourceUrl: string, areaName: st
 
     // First line is always "## [Shop Name](url)"
     const name = stripMarkdownLinks(lines[0])
-    if (!name || name.length < 4 || name.length > 100) continue
-    // Skip navigation/header entries
-    if (/^(find|search|top|popular|home|menu|footer|advertisement)/i.test(name)) continue
+    if (!name || name.length < 4 || name.length > 80) continue
+    // Skip article headings and navigation — real shop names don't start like this
+    if (/^(table of contents|history of|types of|applications|manufacturing|factors to|indian market|maintenance|introduction|overview|what is|how to|benefits|advantages|disadvantages|find|search|top|popular|home|menu|footer|advertisement|skip to)/i.test(name)) continue
+    // Real shop listings have ratings or address nearby — article pages don't
+    const hasShopSignal = /\d\.\d/.test(block) || /Ratings?/i.test(block) || /Opens?\s+at/i.test(block) || /Show Number/i.test(block)
+    if (!hasShopSignal) continue
 
     // Rating: "- 4.9" followed by "- 72 Ratings"
     const ratingMatch = block.match(/[-\s](\d\.\d)\s*\n/)
@@ -337,7 +340,7 @@ export async function POST(req: NextRequest) {
 
     // Scrape top 3 listing pages (mix of JD + IM)
     const toScrape = [...jdResults, ...imResults]
-      .filter(r => r.url.includes('justdial.com') || r.url.includes('indiamart.com'))
+      .filter(r => (r.url.includes('justdial.com') || r.url.includes('indiamart.com')) && !r.url.includes('/jdmart/'))
       .slice(0, 3)
       .map(r => r.url)
 
