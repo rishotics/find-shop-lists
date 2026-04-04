@@ -135,7 +135,13 @@ async function x402Post(url: string, body: object): Promise<unknown> {
     body: JSON.stringify(body),
   }
 
-  let res = await fetch(url, init)
+  let res: Response
+  try {
+    res = await fetch(url, init)
+  } catch (err) {
+    console.error(`[x402] Network error fetching ${url}:`, err)
+    throw new Error(`Cannot reach stableenrich.dev — check your internet connection or DNS. (${(err as Error).message})`)
+  }
 
   if (res.status === 402) {
     if (!WALLET_PRIVATE_KEY) {
@@ -321,6 +327,7 @@ export async function POST(req: NextRequest) {
   const seen = new Set<string>()
   const query = comments ? `${keywords} ${comments}` : keywords
 
+  try {
   for (const area of areaList) {
     // Search JustDial and IndiaMART in parallel
     const [jdResults, imResults] = await Promise.all([
@@ -346,6 +353,15 @@ export async function POST(req: NextRequest) {
         }
       }
     }
+  }
+
+  } catch (err) {
+    const message = (err as Error).message ?? 'Unknown error'
+    console.error('[search] fatal error:', err)
+    return NextResponse.json(
+      { error: 'search_failed', message },
+      { status: 502 },
+    )
   }
 
   return NextResponse.json({
